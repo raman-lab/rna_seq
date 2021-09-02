@@ -1,6 +1,6 @@
 #Monte carlo sampling the NGS reads to recalculate fold enrichment.
 #Uses python3 for the latest version of dask
-#Need to change print functions
+
 import pandas as pd
 import numpy as np
 import matplotlib
@@ -41,7 +41,7 @@ def diag_indices(diag_list,variables):
 
 def read_concat_barcodes(file_lst):
 	x = dd.read_csv(file_lst[0],header=0)
-	x = x.drop(x.columns[0],axis=1)
+	x = x.set_index(x.columns[0])
 	y = pd.read_csv(file_lst[1],header=0,index_col=0)
 	return x,y
 
@@ -229,7 +229,7 @@ def sum_ratios(sum_df,inner,outer,total_df,start_val):
 	return sum_df,first_ratio_df,final_ratio_df
 
 
-#----monte carlo functions
+#----monte carlo read sampling functions
 def monte_carlo_read_sampling(read_df,nsample):
 	nsample = np.float64(nsample)
 #	print(read_df.shape[0])
@@ -242,12 +242,215 @@ def monte_carlo_read_sampling(read_df,nsample):
 	return mc_df
 
 #@dask.delayed
-add_col(df):
+def add_col(df):
 	out = df[df.columns[0]].apply(lambda x: np.random.randint(0,x))
 
-#@dask.delayed
+#----monte carlo read sampling functions end
 
-#----monte carlo functions end
+
+#----monte carlo barcode sampling functions
+def bars_from_mapped(mapping_df):
+	out_lst = []
+	names = []
+	for x in range(0,mapping_df.shape[0]):
+		temp = dd.from_pandas(pd.DataFrame(mapping_df.iloc[x,1:]),npartitions=1)
+#		print temp
+		out_lst.append(temp)
+		names.append(mapping_df.iat[x,0])
+	return out_lst,names
+
+def bar_rsample(dd_cols,nsample):
+	samples = []
+	for x in dd_cols:
+		sample = bar_shuffler(x,nsample)
+		samples.append(sample)
+	return samples
+
+@dask.delayed
+def bar_shuffler(indf,nsample):
+	shuffles = []
+	for x in range(0,nsample):
+		shuffles.append(indf.sample(frac=1))
+	return shuffles
+
+def bar_split_dfs(shuf_lst,nsplit):
+	out_lst = []
+	for dfs in shuf_lst:
+		bruh = bar_partition_dfs(dfs,nsplit)
+		out_lst.append(bruh)
+	return out_lst
+
+@dask.delayed
+def bar_partition_dfs(dfs,nsplit):
+#	nsplit = nsplit-1
+	bruh = []
+	for df in dfs:
+		df = df.dropna(how='any')
+		dfsize = int(len(df)/nsplit)
+#		print(df)
+#		print(dfsize)
+		try:
+			partitioned = dd.concat([df.iloc[i*dfsize:(i+1)*dfsize].copy() for i in range(nsplit)],axis=1)
+		except ValueError:
+			print('bar_partition_dfs ValueError')
+			print(df)
+			print(dfsize)
+			quit()
+		else:
+			partitioned.columns = range(nsplit)
+			bruh.append(partitioned)
+	return bruh
+
+def bar_get_counts(df_list,val_df):
+	out = []
+	for x in df_list:
+		y = grab_bar_counts(dask.compute(*x),val_df)
+		out.append(y)
+	return out
+
+@dask.delayed
+def grab_bar_counts(df_list,val_df):
+	out_dfs = []
+	for x in df_list:
+		temp_dfs = []
+		for y in x.columns:
+#			z = dd.from_pandas(x[y].to_frame(),npartitions=1)
+			z = pd.DataFrame(x[y])
+			t = z.dropna(how='any',axis=0)
+			t = t.set_index(t.columns[0])
+			try: 
+				temp = dd.concat([t,val_df],join='inner',axis=1)
+			except ValueError:
+				print('Got valueerror')
+				print(x)
+				print(z)
+				print(t)
+#				print(val_df)
+				quit()
+			else:
+				temp = temp.drop_duplicates(keep='first')
+				temp_dfs.append(temp.sum(axis=0))
+		sum_dfs = dd.concat(temp_dfs,join='outer',axis=1)
+		out_dfs.append(sum_dfs)
+	return out_dfs
+	
+#----monte carlo barcode sampling functions end
+
+
+#----Bootstrap error functions------
+def bootse(df):
+	means = df.apply(np.mean,axis=0)
+	se = np.std(means)
+	return means,se
+
+def jack_sample(arr):
+	out_df = pd.DataFrame()
+	for x in range(0,arr.shape[0]):
+		out_df[x] = np.concatenate((arr[:x],arr[x+1:]),axis=None)
+	return out_df
+	
+def jackse(df):
+	means = np.mean(df)
+	jse =  np.sqrt(np.float64((means.shape[0]-1.0)/means.shape[0])*np.sum((means-np.mean(means))**2))
+	return means,jse
+
+def bca_calc(arr,nboot,alpha,converge,threshold):
+#	print arr
+	if converge == False:
+		theta_hat = np.nanmean(arr)
+		nx = arr.shape[0]
+#		bsamp = get_sample(arr,nboot)
+		bsamp = pd.DataFrame(arr)
+#		print bsamp.shape
+		bmeans,bse = bootse(bsamp)
+#		print bmeans
+		jsamp = jack_sample(arr)
+		jmeans,jse = jackse(jsamp)
+	else:
+		theta_hat = np.nanmean(arr)
+		nx = arr.shape[0]
+		bsamp = get_sample(arr,nboot)
+		jsamp = jack_sample(arr)
+		jmeans,jse = jackse(jsamp)
+		while True:
+			old_bmeans,old_bse = bootse(bsamp)
+			bsamp = pd.concat([bsamp,get_sample(arr,nboot)],axis=1)
+			bmeans,bse = bootse(bsamp)
+			if np.absolute(np.mean(old_bmeans)-np.mean(bmeans))/np.mean(bmeans) < threshold:
+	#			print np.absolute(old_bmeans-bmeans)/bmeans
+				nboot = bsamp.shape[1]
+				break
+			else:
+				pass
+#	print bsamp.shape
+#	print bse, jse
+	if bse == 0 or jse == 0:
+		alpha1=alpha
+		alpha2=1-alpha
+		z0 = None
+		ahat = None
+	else:
+		z0 = decimal.Decimal(
+			scipy.stats.norm.ppf(np.sum(bmeans<theta_hat)/np.float64(nboot))
+			)
+		atop = decimal.Decimal(np.sum((np.mean(jmeans)-jmeans)**3.0))
+		abot = decimal.Decimal(6.0*(((jse**2.0)*(nx/(nx-1.0)))**(3/2.0)))
+		ahat = atop/abot
+#		print ahat,abot
+		alpha1 = scipy.stats.norm.cdf(np.float64(
+			z0+(z0+decimal.Decimal(scipy.stats.norm.ppf(alpha)))/(
+			1-ahat*(z0+decimal.Decimal(scipy.stats.norm.ppf(alpha))))))
+		alpha2 = scipy.stats.norm.cdf(np.float64(
+			z0+(z0+decimal.Decimal(scipy.stats.norm.ppf(1.0-alpha)))/(
+			1-ahat*(z0+decimal.Decimal(scipy.stats.norm.ppf(1-alpha))
+			))))
+#	print alpha1,alpha2
+	confpoint = np.quantile(bmeans,[alpha1,alpha2])
+	percentiles = [alpha1,alpha2]
+	u=jmeans-theta_hat
+	return confpoint,z0,ahat,u,bmeans,bse,bsamp,percentiles
+
+def ci_calc(arr,alpha):
+	return np.quantile(arr,[alpha,1.0-alpha])
+
+def format_out(perc,confpoint,z0,ahat,bse,alpha):
+	out_df = pd.DataFrame()
+	out_df['actual_percentile']=[alpha,1.0-alpha]
+	out_df['adjusted_percentiles']=perc
+	out_df['confidence_interval']=confpoint
+	out_df['bias_correction_z0']=[z0,None]
+	out_df['acceleration_factor_ahat']=[ahat,None]
+	out_df['bootstrap_standard_error']=[bse,None]
+	return out_df
+#----bootstrap error funcs end-----
+
+
+#----visualization-----
+def box_plot(out_df,basename,notext,use_range):
+#	hfont = {'fontname': 'Helvetica'}
+	to_plot = [out_df[x].to_list() for x in out_df.columns]
+	fig,ax = plt.subplots(1,1)
+	fig.set_size_inches(8,6)
+#	print plot_vals
+	if use_range == False:
+		ax.boxplot(to_plot,sym='.')
+	else:
+		ax.boxplot(to_plot,whis='range')
+	if notext == False:
+		ax.set_xticklabels(out_df.columns,fontsize=8,rotation=45,ha='right')
+	else:
+		ax.tick_params(labelbottom=False)
+	plt.tight_layout()
+	if notext==False:
+		plt.savefig('{0}_boxplot_labeled.pdf'.format(basename),transparent=True)
+	else:
+		plt.savefig('{0}_boxplot.pdf'.format(basename),transparent=True)
+	plt.close()
+
+
+
+
+#----visualization end-----
 def all_funcs(input_lst,map_file,barcode_file,take_sum,bc_controls,outname,
 		take_median,diagram_vars,cutoff,inner,outer,bc_input,shell):
 	if outname is None:
@@ -337,10 +540,8 @@ def all_funcs(input_lst,map_file,barcode_file,take_sum,bc_controls,outname,
 	concat_count_df = concat_count_df.compute()
 	concat_count_df.to_csv('{0}_barcode_counts.csv'.format(outname))
 	
-	
-	
 def monte_carlo_funcs(input_lst,map_file,barcode_file,take_sum,bc_controls,outname,
-		take_median,diagram_vars,cutoff,inner,outer,mc_sample,mc_cycles,shell):
+		take_median,diagram_vars,cutoff,inner,outer,mc_cycles,mc_sample,shell):
 	variables = diagram_vars.split(',')
 	diag_list = read_diagram(map_file)
 	diag_ndxs = diag_indices(diag_list,variables)
@@ -407,7 +608,91 @@ def monte_carlo_funcs(input_lst,map_file,barcode_file,take_sum,bc_controls,outna
 	final_out_df['stdev']=mc_std_df.iloc[:,1:].mean(axis=1)
 	final_out_df.to_csv('{0}_mc_final.csv'.format(outname))
 
+def monte_carlo_barcode_sample(input_lst,map_file,barcode_file,take_sum,
+	bc_controls,outname,take_median,diagram_vars,cutoff,inner,outer,bc_input,mc_cycles,
+	mc_sample,shell):
+	if outname is None:
+		outname = input_lst[0].split('/')[-1].split('.')[0]
+	else:
+		pass
+	mapping_df = read_mapped_barcodes(barcode_file)
+	variables = diagram_vars.split(',')
+	diag_list = read_diagram(map_file)
+	diag_ndxs = diag_indices(diag_list,variables)
+	if bc_input == False and shell == False:
+		in_df_dict = OrderedDict()
+		total_dict = OrderedDict()
+		for input in input_lst:
+			base = input.split('/')[-1].split('.')[0]
+			input_df = read_csv(input,base)
+			barcodes_df = get_barcodes(input_df,diag_list,diag_ndxs,False)
+			in_df_dict[base],total_dict[base] = get_barcode_counts(barcodes_df,cutoff)
+		concat_count_df = intersection(in_df_dict)
+		total_df = pd.DataFrame.from_dict(total_dict,orient='columns')
+	elif bc_input == True and shell == False:
+		concat_count_df,total_df = read_concat_barcodes(input_lst)
+#		print(concat_count_df.compute())
+	elif bc_input == False and shell == True:
+		in_df_dict = OrderedDict()
+		total_dict = OrderedDict()
+		in_df_lst = dask.compute(delayed_shell(input_lst,cutoff))
+		concat_count_df = intersection_dfs(in_df_lst[0])
+		print(concat_count_df.head)
+		name_list = [input.split('/')[-1].split('.')[0] for input in input_lst]
+		total_df = pd.DataFrame([[x.sum(axis=0).compute()[0] for x in in_df_lst[0]]],
+			columns=name_list)
+	if bc_controls is not None:
+		print(bc_controls)
+		control_names_df = read_control_names(bc_controls)
+		control_counts_df = control_intersection(control_names_df,concat_count_df)
+		control_counts_df.to_csv('{0}_control_counts.csv'.format(outname))
+		control_first_ratio_df,control_ind_df = ratios(control_counts_df,inner,
+			outer,input_lst,total_df,1)
+		print('control\n',control_ind_df)
+		control_ind_df.to_csv('{0}_control_fold_enrichment.csv'.format(outname))
+	else:
+		pass
+	bar_cols,variant_names = bars_from_mapped(mapping_df)
+#	print(mapping_df)
+	bar_shuffled = dask.compute(*bar_rsample(bar_cols,mc_cycles))
+	print(len(bar_shuffled))
+	print(len(bar_shuffled[0]))
+	print(bar_shuffled[0][0])
+	split_shuffled = dask.compute(*bar_split_dfs(bar_shuffled,mc_sample))
+	print(split_shuffled[0][0].compute())
+	split_counted = dask.compute(*bar_get_counts(split_shuffled,concat_count_df))
+#	zipped_muts = zip(*split_counted)
+	bootstrap_dict = OrderedDict()
+	boot_iterations_df = pd.DataFrame()
+	for z in range(0,len(split_counted)):
+		out_dict = OrderedDict()
+		x = dask.compute(*split_counted[z])
+		for y in range(0,len(x)):
+			first_ratio_df,final_ratio_df = ratios(x[y].transpose(),inner,outer,
+				input_lst,total_df,0)
+			if bc_controls is not None:
+				norm_df = normalize(final_ratio_df,control_ind_df)
+			else:
+				norm_df = final_ratio_df
+#			print('norm_df: \n',norm_df)
+			if take_median == False:
+				out_dict[y] = [norm_df.iloc[:,0].mean(axis=0)]
+				colnames = ['mean']
+			else:
+				out_dict[y] = [norm_df.iloc[:,0].median(axis=0)]
+				colnames = ['median']
+		out_df = pd.DataFrame.from_dict(out_dict,orient='index')
+		confpoint,z0,ahat,u,bmeans,bse,bsamp,perc = bca_calc(
+			out_df.iloc[:,0],1,
+			0.05,False,0.001)
+		bootstrap_dict[variant_names[z]] = [np.mean(out_df.iloc[:,0]),confpoint[0],confpoint[1]]
+		boot_iterations_df[variant_names[z]] = out_df.iloc[:,0]
+	bootstrap_df = pd.DataFrame.from_dict(bootstrap_dict,orient='index')
+	bootstrap_df.to_csv('{0}_bootstrap_ci.csv'.format(outname))
+	boot_iterations_df.to_csv('{0}_bootstrap_data.csv'.format(outname))
+	box_plot(boot_iterations_df,outname,False,False)
 		
+			
 if __name__ == '__main__': 
 	parser = argparse.ArgumentParser(prefix_chars='-+',description='''
 	Written for Python3
@@ -427,7 +712,7 @@ if __name__ == '__main__':
 	required.add_argument('--barcodes','-b',required=True,
 		help='Mapped barcode file from Miseq or PacBio mapping')
 	parser.add_argument('--monte_carlo','-mc',required=False,default=None,
-		help='Specify Monte Carlo sample size. Default is None -- no MC analysis performed. If the value is a decimal, will take a percentage of the respective read count. If using shell-analysis input, this must be a decimal')
+		help='Specify Monte Carlo sample size. Default is None -- no MC analysis performed. If the value is a decimal, will take a percentage of the respective read count. If using shell-analysis input, this must be a decimal. If barcode sampling is called, then this is the number of groups to downsample barcodes into.')
 	parser.add_argument('--sum','-s',required=False,default=False,action='store_true',
 		help='Call this flag to force summed analysis of variant performance')
 	parser.add_argument('--controls','-c',required=False,default=None,
@@ -455,21 +740,29 @@ if __name__ == '__main__':
 		help='Indicate a single barcode_counts.csv file that can be used instead of multiple input files. The first input must be the barcode_counts.csv file and the second must be a totals.csv file')
 	parser.add_argument('++shell','+s',required=False,default=False,action='store_true',
 		help='Call this flag if input files are from barcode counts in the format of barcode,count from bash analysis (no header).')
+	parser.add_argument('--mc_bar','-mb',required=False,action='store_true',default=False,
+		help='Call this flag to force monte carlo sampling of barcodes. If this flag is called, the --monte_carlo flag will dictate the number of barcode groups and ++mc_cycles flag will be the number of times to iterate.')
 		
 	
 	parsed = parser.parse_args()
 	if parsed.outname is None:
-		outname = input_lst[0].split('/')[-1].split('.')[0]
+		outname = parsed.input[0].split('/')[-1].split('.')[0]
 	else:
 		outname = parsed.outname
 
-	if parsed.monte_carlo is None:
+	if parsed.monte_carlo is None and parsed.mc_bar == False:
 		all_funcs(parsed.input,parsed.map,parsed.barcodes,parsed.sum,
 			parsed.controls,outname,parsed.median,parsed.variables,
 			int(parsed.cutoff),parsed.inner,parsed.outer,parsed.bc_counts,parsed.shell)
-	else:
+	elif parsed.monte_carlo is not None and parsed.mc_bar == True:
+		monte_carlo_barcode_sample(parsed.input,parsed.map,parsed.barcodes,parsed.sum,
+			parsed.controls,outname,parsed.median,parsed.variables,
+			int(parsed.cutoff),parsed.inner,parsed.outer,
+			parsed.bc_counts,int(parsed.mc_cycles),int(parsed.monte_carlo),parsed.shell)
+	elif parsed.monte_carlo is not None and parsed.mc_bar == False:
 		monte_carlo_funcs(parsed.input,parsed.map,parsed.barcodes,parsed.sum,
 			parsed.controls,outname,parsed.median,parsed.variables,
 			int(parsed.cutoff),parsed.inner,parsed.outer,parsed.monte_carlo,
 			int(parsed.mc_cycles))
-
+	else:
+		pass
