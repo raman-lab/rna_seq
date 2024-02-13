@@ -52,7 +52,7 @@ pc_encoded = pc_encode(vl_df_full['Mut_Pos'], indexes=vl_df_full.index.tolist())
 pc_encoded.to_csv("pcencoded.csv")
 
 
-## Random UMAP parameter search
+## Random UMAP parameter search. Taken from David Borrelli (https://towardsdatascience.com/clustering-sentence-embeddings-to-identify-intents-in-short-text-48d22d3bf02e)
 def generate_clusters(message_embeddings,
                       n_neighbors,
                       n_components,
