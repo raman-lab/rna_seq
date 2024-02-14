@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.collections import PatchCollection
 
-
+#Script to identify enriched clusters for each ligand
 
 cluster_df = pd.read_csv('avg_foldenrichment_full_clustered.csv')
 
